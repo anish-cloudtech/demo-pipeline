@@ -1,0 +1,430 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "This is a template to create ETL pipeline pattern with AWS Step Functions"
+
+Metadata:
+  Description: "ETL Orchestration Using AWS Step Function By Muskan Gupta, Anish Kumar Nrala, Adrash Kumar Singh"
+
+Parameters: 
+
+  SourceBucket:
+    Description: "Bucket to store raw dataset"
+    Type: String
+
+  DestinationBucket:
+    Description: "Bucket to store transformed dataset"
+    Type: String 
+
+  ScriptBucket:
+    Description: "Bucket to store transformation script"
+    Type: String 
+
+  GlueCrawlerName:
+    Description: "Crawler to crawl raw dataset"
+    Type: String
+
+  GlueDatabaseName:
+    Description: "Database to store schema"
+    Type: String
+
+  SNSTopicEmail:
+    Description: "Email address to send success/error notification"
+    Type: String 
+
+
+Resources:
+  S3SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SourceBucket
+
+  S3ScriptBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ScriptBucket
+  
+  S3DestinationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DestinationBucket
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: "alias/aws/sns"
+      Subscription:
+        - Endpoint: !Ref SNSTopicEmail
+          Protocol: "email"
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: S3ObjectUploadedEventTrigger
+      Description: Trigger a Step Functions execution in response to an S3 object upload event.
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket: 
+            name: 
+              - !Ref SourceBucket
+      Targets:
+        - Arn: !GetAtt StepFunction.Arn
+          Id: StartExecution
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: '/'
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !GetAtt StepFunction.Arn
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              file_extension = event["detail"]["object"]["key"].split('.')[1]
+              if file_extension == 'csv':
+                return {
+                    'statusCode': 200
+                }
+              else:
+                return {
+                    'statusCode': 400
+                }
+      Handler: index.lambda_handler
+      FunctionName: 'validate-lambda-function'
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 5
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: '/'
+      Policies:
+      - PolicyName: s3-cloudwatch-access-inline-policy
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              - s3:Get*
+            Resource:
+              - !Sub arn:aws:s3:::${SourceBucket}
+              - !Sub arn:aws:s3:::${SourceBucket}/*
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: 'arn:aws:logs:*:*:*'
+      
+  GlueDatabase:
+    Type: 'AWS::Glue::Database'
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+
+  GlueCrawler:
+    Type: 'AWS::Glue::Crawler'
+    Properties:
+      Name: !Ref GlueCrawlerName
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets: 
+        S3Targets:
+          - Path: !Join ["",["s3://", !Ref SourceBucket]]
+
+
+  GlueCrawlerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'inline-glue-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 's3:GetObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${SourceBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                Resource: !Sub 'arn:aws:s3:::${SourceBucket}'
+              - Effect: Allow
+                Action:
+                  - 'glue:CreateDatabase'
+                  - 'glue:GetDatabase'
+                  - 'glue:UpdateDatabase'
+                  - 'glue:CreateTable'
+                  - 'glue:GetTable'
+                  - 'glue:UpdateTable'
+                Resource: '*'
+              - Effect: "Allow"
+                Action: "logs:*"
+                Resource: "*"
+
+  GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${ScriptBucket}/script.py"
+      DefaultArguments:
+        "--enable-auto-scaling": "true"
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--job-language": python
+      ExecutionProperty:
+        MaxConcurrentRuns: 20
+      MaxRetries: 0
+      Role: !Ref GlueJobRole
+      GlueVersion: "3.0"
+      NumberOfWorkers: 100
+      WorkerType: G.1X
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "glue.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "s3access"
+                Effect: "Allow"
+                Action: 
+                  - "s3:List*"
+                  - "s3:Get*"
+                  - "s3:Put*"
+                  - "s3:Delete*"
+                Resource: "*"
+              - Sid: "glue"
+                Effect: "Allow"
+                Action: "glue:*"
+                Resource: "*"
+              - Sid: "cwlog"
+                Effect: "Allow"
+                Action: "logs:*"
+                Resource: "*"
+
+  StepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: step-function
+      DefinitionString:
+        Fn::Sub: |
+          {
+              "Comment": "A description of my state machine",
+              "StartAt": "Validate Input CSV",
+              "States": {
+                  "Validate Input CSV": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "OutputPath": "$.Payload",
+                      "Parameters": {
+                          "Payload.$": "$",
+                          "FunctionName": "${LambdaFunction.Arn}"
+                      },
+                      "Next": "Check For Validation Success"
+                  },
+                  "Check For Validation Success": {
+                      "Type": "Choice",
+                      "Choices": [
+                          {
+                              "Variable": "$.statusCode",
+                              "NumericEquals": 200,
+                              "Next": "Start Crawler For CSV File"
+                          },
+                          {
+                              "Variable": "$.statusCode",
+                              "NumericEquals": 400,
+                              "Next": "FAIL - Error Notification"
+                          }
+                      ]
+                  },
+                  "FAIL - Error Notification": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::sns:publish",
+                      "Parameters": {
+                          "Message.$": "$",
+                          "TopicArn": "${SNSTopic}"
+                      },
+                      "End": true
+                  },
+                  "Start Crawler For CSV File": {
+                      "Type": "Task",
+                      "Parameters": {
+                          "Name": "${GlueCrawlerName}"
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+                      "Retry": [
+                          {
+                              "ErrorEquals": [
+                                  "CrawlerRunningException"
+                              ],
+                              "IntervalSeconds": 10,
+                              "MaxAttempts": 10,
+                              "BackoffRate": 2
+                          }
+                      ],
+                      "Catch": [
+                          {
+                              "ErrorEquals": [
+                                  "CrawlerRunningException"
+                              ],
+                              "Comment": "Crawler is running for long time",
+                              "Next": "FAIL - Error Notification"
+                          },
+                          {
+                              "ErrorEquals": [
+                                  "States.ALL"
+                              ],
+                              "Comment": "Error fall back",
+                              "ResultPath": "$.error-info",
+                              "Next": "FAIL - Error Notification"
+                          }
+                      ],
+                      "Next": "CSV File Crawler Status Check"
+                  },
+                  "CSV File Crawler Status Check": {
+                      "Type": "Task",
+                      "Parameters": {
+                          "Name": "${GlueCrawlerName}"
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+                      "Next": "CSV File Crawler Finished?"
+                  },
+                  "CSV File Crawler Finished?": {
+                      "Type": "Choice",
+                      "Choices": [
+                          {
+                              "Variable": "$.Crawler.State",
+                              "StringEquals": "RUNNING",
+                              "Next": "CSV File Crawler Wait"
+                          },
+                          {
+                              "Variable": "$.Crawler.State",
+                              "StringEquals": "STOPPING",
+                              "Next": "CSV File Crawler Wait"
+                          },
+                          {
+                              "Variable": "$.Crawler.State",
+                              "StringEquals": "FAILED",
+                              "Next": "FAIL - Error Notification"
+                          },
+                          {
+                              "Variable": "$.Crawler.State",
+                              "StringEquals": "RETRYLIMITREACH",
+                              "Next": "FAIL - Error Notification"
+                          },
+                          {
+                              "Variable": "$.Crawler.State",
+                              "StringEquals": "READY",
+                              "Next": "Run Glue Job"
+                          }
+                      ]
+                  },
+                  "CSV File Crawler Wait": {
+                      "Type": "Wait",
+                      "Seconds": 10,
+                      "Next": "CSV File Crawler Status Check"
+                  },
+                  "Run Glue Job": {
+                    "Type": "Task",
+                    "ResultPath": null,
+                    "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                    "Parameters": {
+                        "JobName": "${GlueJob}"
+                    },
+                    "End": true,
+                    "Catch": [
+                            {
+                                "ErrorEquals": [
+                                    "States.ALL"
+                                ],
+                                "Comment": "Error fall back for glue job",
+                                "ResultPath": "$.error-info",
+                                "Next": "FAIL - Error Notification"
+                            }
+                        ]
+                  }
+              }
+          }
+      RoleArn: !GetAtt StepFunctionRole.Arn
+
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: step-function-inline-policy
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: "lambda:InvokeFunction"
+            Resource: !GetAtt LambdaFunction.Arn        
+          - Effect: "Allow"
+            Action: 
+              - "glue:*"
+            Resource: "*"
+
+          - Effect: Allow
+            Action:
+              - sns:*
+            Resource: '*'

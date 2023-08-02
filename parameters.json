@@ -1,0 +1,26 @@
+[
+    {
+      "ParameterKey": "SourceBucket",
+      "ParameterValue": "cloudtech-etl-source-bucket"
+    },
+    {
+        "ParameterKey": "DestinationBucket",
+        "ParameterValue": "cloudtech-etl-destination-bucket"
+    },
+    {
+        "ParameterKey": "ScriptBucket",
+        "ParameterValue": "cloudtech-etl-script-bucket"
+    },
+    {
+        "ParameterKey": "GlueCrawlerName",
+        "ParameterValue": "cloudtech-etl-glue-crawler"
+    },
+    {
+        "ParameterKey": "GlueDatabaseName",
+        "ParameterValue": "cloudtech-etl-glue-database"
+    },
+    {
+        "ParameterKey": "SNSTopicEmail",
+        "ParameterValue": "muskan.g@consultadd.com"
+    }
+]
